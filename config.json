@@ -1,0 +1,15 @@
+{
+  "show": {
+    "model": true,
+    "context": true,
+    "session": true,
+    "weekly": true,
+    "reset_times": true
+  },
+  "bar_size": 10,
+  "cache_ttl_seconds": 60,
+  "theme": {
+    "low_threshold": 50,
+    "high_threshold": 80
+  }
+}
