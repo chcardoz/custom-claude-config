@@ -1,0 +1,20 @@
+{
+  "name": "custom-claude-config",
+  "owner": {
+    "name": "chcardoz"
+  },
+  "metadata": {
+    "description": "Custom Claude Code plugins by chcardoz"
+  },
+  "plugins": [
+    {
+      "name": "redline",
+      "source": ".",
+      "description": "Rich statusline showing model, context, session/weekly usage with progress bars",
+      "version": "0.1.0",
+      "author": {
+        "name": "chcardoz"
+      }
+    }
+  ]
+}
