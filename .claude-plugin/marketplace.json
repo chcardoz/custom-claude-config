@@ -9,7 +9,10 @@
   "plugins": [
     {
       "name": "redline",
-      "source": ".",
+      "source": {
+        "source": "github",
+        "repo": "chcardoz/custom-claude-config"
+      },
       "description": "Rich statusline showing model, context, session/weekly usage with progress bars",
       "version": "0.1.0",
       "author": {
