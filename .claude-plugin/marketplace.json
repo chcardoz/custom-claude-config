@@ -14,7 +14,7 @@
         "url": "https://github.com/chcardoz/custom-claude-config.git"
       },
       "description": "Rich statusline showing model, context, session/weekly usage with progress bars",
-      "version": "0.1.0",
+      "version": "0.1.2",
       "author": {
         "name": "chcardoz"
       }
