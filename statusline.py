@@ -6,6 +6,7 @@
 import json
 import os
 import platform
+import ssl
 import subprocess
 import sys
 import time
@@ -147,6 +148,24 @@ def write_cache(usage_data: dict) -> None:
 # ─── API ─────────────────────────────────────────────────────────────────────
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """Build an SSL context, trying certifi then system certs."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    # macOS: try the Homebrew / system cert bundle locations
+    for ca in (
+        "/etc/ssl/cert.pem",
+        "/opt/homebrew/etc/openssl/cert.pem",
+        "/usr/local/etc/openssl/cert.pem",
+    ):
+        if os.path.isfile(ca):
+            return ssl.create_default_context(cafile=ca)
+    return ssl.create_default_context()
+
+
 def fetch_usage(token: str) -> dict | None:
     """Call Anthropic usage API."""
     req = urllib.request.Request(
@@ -157,7 +176,8 @@ def fetch_usage(token: str) -> dict | None:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        ctx = _ssl_context()
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
             return json.loads(resp.read().decode())
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
         return None
@@ -266,8 +286,8 @@ def main() -> None:
         five_hour = usage.get("five_hour", {})
         seven_day = usage.get("seven_day", {})
 
-        session_pct = (five_hour.get("utilization", 0)) * 100
-        weekly_pct = (seven_day.get("utilization", 0)) * 100
+        session_pct = five_hour.get("utilization", 0)
+        weekly_pct = seven_day.get("utilization", 0)
 
         parts_line2 = []
         parts_line3 = []
