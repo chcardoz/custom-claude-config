@@ -4,7 +4,10 @@
     "context": true,
     "session": true,
     "weekly": true,
-    "reset_times": true
+    "reset_times": true,
+    "spotify": true,
+    "focus": true,
+    "system": true
   },
   "bar_size": 10,
   "cache_ttl_seconds": 60,
