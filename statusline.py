@@ -21,6 +21,7 @@ PLUGIN_ROOT = Path(os.environ.get("CLAUDE_PLUGIN_ROOT", Path(__file__).parent))
 CONFIG_PATH = PLUGIN_ROOT / "config.json"
 CACHE_DIR = Path.home() / ".cache" / "redline"
 CACHE_PATH = CACHE_DIR / "cache.json"
+STRETCH_STATE_PATH = CACHE_DIR / "stretch_state.json"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
 HTTP_TIMEOUT = 5
@@ -47,10 +48,13 @@ def load_config() -> dict:
             "spotify": True,
             "focus": True,
             "system": True,
+            "stretch": True,
         },
         "bar_size": 10,
         "cache_ttl_seconds": 60,
         "theme": {"low_threshold": 50, "high_threshold": 80},
+        "stretch_interval_minutes": 15,
+        "stretch_sound": "Glass",
     }
     try:
         with open(CONFIG_PATH) as f:
@@ -347,6 +351,66 @@ def get_system_info() -> dict | None:
     return None
 
 
+def _read_stretch_state() -> dict:
+    """Read stretch state from cache file."""
+    try:
+        with open(STRETCH_STATE_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_stretch_state(state: dict) -> None:
+    """Write stretch state to cache file."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(STRETCH_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+
+
+def _check_stretch_reminder(interval_minutes: int, sound: str) -> str | None:
+    """Check if a stretch reminder is due and return elapsed session time string."""
+    now = time.time()
+    state = _read_stretch_state()
+
+    # Start a new session if no prior state or last render is stale (>5 min gap)
+    if not state.get("session_start") or now - state.get("last_render", 0) > 300:
+        state = {"session_start": now, "last_render": now, "last_notification": now}
+        _write_stretch_state(state)
+        return "0m"
+
+    state["last_render"] = now
+
+    # Check if notification is due
+    interval_seconds = interval_minutes * 60
+    if now - state.get("last_notification", 0) >= interval_seconds:
+        elapsed_minutes = int((now - state["session_start"]) / 60)
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "You have been working for {elapsed_minutes} minutes. '
+                 f'Time to stand up and stretch!" '
+                 f'with title "Stretch Reminder" sound name "{sound}"'],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        state["last_notification"] = now
+
+    _write_stretch_state(state)
+
+    # Format elapsed time
+    elapsed_seconds = int(now - state["session_start"])
+    minutes = elapsed_seconds // 60
+    if minutes >= 60:
+        hours = minutes // 60
+        mins = minutes % 60
+        return f"{hours}h{mins:02d}m"
+    return f"{minutes}m"
+
+
 def format_reset_time(iso_str: str) -> str:
     """Format an ISO 8601 timestamp as a friendly local time string."""
     try:
@@ -373,8 +437,6 @@ def strip_ansi(s: str) -> str:
     return re.sub(r"\033\[[0-9;]*m", "", s)
 
 
-DIVIDER = object()  # sentinel for section dividers
-
 BRAILLE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SPINNER_STATE_PATH = CACHE_DIR / "spinner.state"
 
@@ -395,20 +457,23 @@ def _spinner_char() -> str:
         return BRAILLE_FRAMES[0]
 
 
-def box_frame(lines: list, title: str = "", min_width: int = 0, footer_right: str = "") -> str:
+def box_frame(lines: list, title: str = "", min_width: int = 0, footer_right: str = "", title_right: str = "") -> str:
     """Wrap lines in a Unicode box-drawing frame with an optional title.
 
-    Lines may contain strings or (DIVIDER, subtitle) tuples to render
-    internal ├─ subtitle ─┤ dividers with spacing.
     footer_right places a string right-aligned on its own line before the bottom border.
+    title_right places a string right-aligned in the top border.
     """
-    # Compute max visible width (skip divider sentinels)
-    content_widths = [len(strip_ansi(l)) for l in lines if not isinstance(l, tuple)]
+    content_widths = [len(strip_ansi(l)) for l in lines]
     width = max(min_width, max(content_widths)) if content_widths else min_width
-    # Top border with title
+    # Top border with title (and optional right title)
     if title:
         title_segment = f" {title} "
-        top = f"╭─{title_segment}{'─' * (width - len(title_segment) + 1)}╮"
+        if title_right:
+            right_segment = f" {title_right} "
+            dashes = width + 2 - len(title_segment) - len(right_segment) - 1
+            top = f"╭─{title_segment}{'─' * dashes}{right_segment}─╮"
+        else:
+            top = f"╭─{title_segment}{'─' * (width - len(title_segment) + 1)}╮"
     else:
         top = f"╭{'─' * (width + 2)}╮"
     # Bottom border
@@ -416,16 +481,8 @@ def box_frame(lines: list, title: str = "", min_width: int = 0, footer_right: st
     # Content rows, padded to width
     framed = [top]
     for line in lines:
-        if isinstance(line, tuple) and line[0] is DIVIDER:
-            subtitle = line[1]
-            # Blank spacer line before divider
-            framed.append(f"│ {' ' * width} │")
-            # Divider with subtitle
-            sub_segment = f" {subtitle} "
-            framed.append(f"├─{sub_segment}{'─' * (width - len(sub_segment) + 1)}┤")
-        else:
-            pad = width - len(strip_ansi(line))
-            framed.append(f"│ {line}{' ' * pad} │")
+        pad = width - len(strip_ansi(line))
+        framed.append(f"│ {line}{' ' * pad} │")
     if footer_right:
         vis_len = len(strip_ansi(footer_right))
         pad = width - vis_len
@@ -510,9 +567,10 @@ def main() -> None:
     if reset_parts:
         content_lines.append(f"{DIM}{'  · '.join(reset_parts)}{RESET}")
 
-    # ── Now Playing (Spotify) ────────────────────────────────────────
+    # ── Spotify + Focus + System (single line) ────────────────────────
+    info_parts: list[str] = []
+
     if show.get("spotify", True):
-        content_lines.append((DIVIDER, "Now Playing"))
         spotify = get_spotify_now_playing()
         if spotify:
             icon = "▶" if spotify["state"] == "playing" else "⏸"
@@ -520,19 +578,16 @@ def main() -> None:
             max_len = 40
             if len(track) > max_len:
                 track = track[:max_len - 1] + "…"
-            content_lines.append(f"♫ {icon} {track}")
+            info_parts.append(f"♫ {icon} {track}")
         else:
-            content_lines.append(f"{DIM}♫ Not playing{RESET}")
-
-    # ── System (Focus + CPU/MEM) ─────────────────────────────────────
-    system_parts: list[str] = []
+            info_parts.append(f"{DIM}♫ Not playing{RESET}")
 
     if show.get("focus", True):
         focus = get_focus_status()
         if focus and focus.get("active"):
-            system_parts.append(f"{YELLOW}Focus On{RESET}")
+            info_parts.append(f"{YELLOW}Focus On{RESET}")
         else:
-            system_parts.append(f"{DIM}Focus Off{RESET}")
+            info_parts.append(f"{DIM}Focus Off{RESET}")
 
     if show.get("system", True):
         sysinfo = get_system_info()
@@ -540,27 +595,35 @@ def main() -> None:
             if sysinfo.get("cpu") is not None:
                 cpu = sysinfo["cpu"]
                 cpu_color = color_for_pct(cpu, theme)
-                system_parts.append(f"CPU {cpu_color}{int(cpu)}%{RESET}")
+                info_parts.append(f"CPU {cpu_color}{int(cpu)}%{RESET}")
             else:
-                system_parts.append(f"CPU {DIM}——%{RESET}")
+                info_parts.append(f"CPU {DIM}——%{RESET}")
             if sysinfo.get("mem") is not None:
                 mem = sysinfo["mem"]
                 mem_color = color_for_pct(mem, theme)
-                system_parts.append(f"MEM {mem_color}{int(mem)}%{RESET}")
+                info_parts.append(f"MEM {mem_color}{int(mem)}%{RESET}")
             else:
-                system_parts.append(f"MEM {DIM}——%{RESET}")
+                info_parts.append(f"MEM {DIM}——%{RESET}")
         else:
-            system_parts.append(f"CPU {DIM}——%{RESET}")
-            system_parts.append(f"MEM {DIM}——%{RESET}")
+            info_parts.append(f"CPU {DIM}——%{RESET}")
+            info_parts.append(f"MEM {DIM}——%{RESET}")
 
-    if system_parts:
-        content_lines.append((DIVIDER, "System"))
-        content_lines.append(f"{'  ·  '.join(system_parts)}")
+    if info_parts:
+        content_lines.append(f"{'  ·  '.join(info_parts)}")
+
+    # ── Stretch reminder ────────────────────────────────────────────
+    title_right = ""
+    if show.get("stretch", True):
+        interval = config.get("stretch_interval_minutes", 15)
+        sound = config.get("stretch_sound", "Glass")
+        elapsed = _check_stretch_reminder(interval, sound)
+        if elapsed:
+            title_right = f"⏱ {elapsed}"
 
     # ── Output in box frame ───────────────────────────────────────────
     spinner = _spinner_char()
     if content_lines:
-        print(box_frame(content_lines, title=model_name, footer_right=spinner))
+        print(box_frame(content_lines, title=model_name, footer_right=spinner, title_right=title_right))
     else:
         print(model_name)
 

@@ -7,10 +7,13 @@
     "reset_times": true,
     "spotify": true,
     "focus": true,
-    "system": true
+    "system": true,
+    "stretch": true
   },
   "bar_size": 10,
   "cache_ttl_seconds": 60,
+  "stretch_interval_minutes": 15,
+  "stretch_sound": "Glass",
   "theme": {
     "low_threshold": 50,
     "high_threshold": 80
