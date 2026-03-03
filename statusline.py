@@ -198,11 +198,12 @@ def format_tokens(n: int | float) -> str:
     return str(n)
 
 
-def progress_bar(pct: float, size: int) -> str:
-    """Build a progress bar string with ● and ○."""
+def progress_bar(pct: float, size: int, theme: dict) -> str:
+    """Build a colored block-style progress bar."""
     filled = round(pct / 100 * size)
     filled = max(0, min(size, filled))
-    return "●" * filled + "○" * (size - filled)
+    color = color_for_pct(pct, theme)
+    return f"{color}{'█' * filled}{'░' * (size - filled)}{RESET}"
 
 
 def color_for_pct(pct: float, theme: dict) -> str:
@@ -234,6 +235,33 @@ def format_reset_time(iso_str: str) -> str:
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
+def strip_ansi(s: str) -> str:
+    """Remove ANSI escape sequences for visible-length calculation."""
+    import re
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
+def box_frame(lines: list[str], title: str = "") -> str:
+    """Wrap lines in a Unicode box-drawing frame with an optional title."""
+    # Compute max visible width
+    width = max(len(strip_ansi(l)) for l in lines)
+    # Top border with title
+    if title:
+        title_segment = f" {title} "
+        top = f"╭─{title_segment}{'─' * (width - len(title_segment) + 1)}╮"
+    else:
+        top = f"╭{'─' * (width + 2)}╮"
+    # Bottom border
+    bottom = f"╰{'─' * (width + 2)}╯"
+    # Content rows, padded to width
+    framed = [top]
+    for line in lines:
+        pad = width - len(strip_ansi(line))
+        framed.append(f"│ {line}{' ' * pad} │")
+    framed.append(bottom)
+    return "\n".join(framed)
+
+
 def main() -> None:
     config = load_config()
     show = config["show"]
@@ -244,33 +272,18 @@ def main() -> None:
     model_info = stdin_data.get("model", {})
     ctx = stdin_data.get("context_window", {})
 
-    # ── Line 1: Model | Tokens | Usage ────────────────────────────────────
-    parts_line1 = []
-
     model_name = model_info.get("display_name", "Unknown")
-    if show.get("model", True):
-        parts_line1.append(f"{CYAN}{model_name}{RESET}")
+    content_lines: list[str] = []
+
+    # ── Build bar segments for a single line ──────────────────────────────
+    bar_parts: list[str] = []
 
     if show.get("context", True):
         total_tokens = ctx.get("total_input_tokens", 0) + ctx.get("total_output_tokens", 0)
         window_size = ctx.get("context_window_size", 0)
         used_pct = ctx.get("used_percentage", 0)
-        remain_pct = ctx.get("remaining_percentage", 100)
-        remaining_tokens = window_size - total_tokens if window_size else 0
-
-        parts_line1.append(f"{format_tokens(total_tokens)} / {format_tokens(window_size)}")
-        parts_line1.append(
-            f"{int(used_pct)}% used {format_tokens(total_tokens)}"
-        )
-        parts_line1.append(
-            f"{int(remain_pct)}% remain {format_tokens(remaining_tokens)}"
-        )
-
-    line1 = " | ".join(parts_line1)
-
-    # ── Lines 2-3: Usage bars + reset times ───────────────────────────────
-    line2 = ""
-    line3 = ""
+        bar = progress_bar(used_pct, bar_size, theme)
+        bar_parts.append(f"ctx {bar} {int(used_pct)}%")
 
     usage = None
     if show.get("session", True) or show.get("weekly", True):
@@ -282,45 +295,41 @@ def main() -> None:
                 if usage:
                     write_cache(usage)
 
+    reset_parts: list[str] = []
+
     if usage:
         five_hour = usage.get("five_hour", {})
         seven_day = usage.get("seven_day", {})
 
-        session_pct = five_hour.get("utilization", 0)
-        weekly_pct = seven_day.get("utilization", 0)
-
-        parts_line2 = []
-        parts_line3 = []
-
         if show.get("session", True):
-            s_color = color_for_pct(session_pct, theme)
-            s_bar = progress_bar(session_pct, bar_size)
-            parts_line2.append(f"current: {s_color}{s_bar}{RESET} {int(session_pct)}%")
-
+            session_pct = five_hour.get("utilization", 0)
+            bar = progress_bar(session_pct, bar_size, theme)
+            bar_parts.append(f"sess {bar} {int(session_pct)}%")
             if show.get("reset_times", True):
                 resets_at = five_hour.get("resets_at", "")
-                parts_line3.append(f"resets {format_reset_time(resets_at)}" if resets_at else "")
+                if resets_at:
+                    reset_parts.append(f"↻ sess {format_reset_time(resets_at)}")
 
         if show.get("weekly", True):
-            w_color = color_for_pct(weekly_pct, theme)
-            w_bar = progress_bar(weekly_pct, bar_size)
-            parts_line2.append(f"weekly: {w_color}{w_bar}{RESET} {int(weekly_pct)}%")
-
+            weekly_pct = seven_day.get("utilization", 0)
+            bar = progress_bar(weekly_pct, bar_size, theme)
+            bar_parts.append(f"week {bar} {int(weekly_pct)}%")
             if show.get("reset_times", True):
                 resets_at = seven_day.get("resets_at", "")
-                parts_line3.append(f"resets {format_reset_time(resets_at)}" if resets_at else "")
+                if resets_at:
+                    reset_parts.append(f"week {format_reset_time(resets_at)}")
 
-        line2 = "  |  ".join(parts_line2)
-        line3 = f"{DIM}{'  |  '.join(p for p in parts_line3 if p)}{RESET}" if any(parts_line3) else ""
+    if bar_parts:
+        content_lines.append("  ".join(bar_parts))
 
-    # ── Output ────────────────────────────────────────────────────────────
-    lines = [line1]
-    if line2:
-        lines.append(line2)
-    if line3:
-        lines.append(line3)
+    if reset_parts:
+        content_lines.append(f"{DIM}{'  · '.join(reset_parts)}{RESET}")
 
-    print("\n".join(lines))
+    # ── Output in box frame ───────────────────────────────────────────────
+    if content_lines:
+        print(box_frame(content_lines, title=model_name))
+    else:
+        print(model_name)
 
 
 if __name__ == "__main__":
