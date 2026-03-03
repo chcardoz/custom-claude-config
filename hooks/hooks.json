@@ -1,15 +1,8 @@
 {
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/setup-statusline.sh"
-          }
-        ]
-      }
-    ]
-  }
+  "SessionStart": [
+    {
+      "type": "command",
+      "command": "bash ${CLAUDE_PLUGIN_ROOT}/scripts/setup-statusline.sh"
+    }
+  ]
 }

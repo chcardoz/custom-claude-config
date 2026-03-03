@@ -2,5 +2,6 @@
   "name": "redline",
   "description": "Rich statusline showing model, context, session/weekly usage with progress bars",
   "version": "0.1.0",
-  "author": { "name": "chcardoz" }
+  "author": { "name": "chcardoz" },
+  "hooks": "./hooks/hooks.json"
 }
