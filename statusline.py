@@ -470,7 +470,7 @@ def box_frame(lines: list, title: str = "", min_width: int = 0, footer_right: st
         title_segment = f" {title} "
         if title_right:
             right_segment = f" {title_right} "
-            dashes = width + 2 - len(title_segment) - len(right_segment) - 1
+            dashes = width + 2 - len(title_segment) - len(right_segment) - 2
             top = f"╭─{title_segment}{'─' * dashes}{right_segment}─╮"
         else:
             top = f"╭─{title_segment}{'─' * (width - len(title_segment) + 1)}╮"
