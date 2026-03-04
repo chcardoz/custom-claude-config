@@ -9,10 +9,13 @@ import platform
 import ssl
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -49,6 +52,7 @@ def load_config() -> dict:
             "focus": True,
             "system": True,
             "stretch": True,
+            "contributions": True,
         },
         "bar_size": 10,
         "cache_ttl_seconds": 60,
@@ -128,6 +132,52 @@ def get_oauth_token() -> str | None:
 
 
 # ─── Cache ───────────────────────────────────────────────────────────────────
+
+SUBPROCESS_CACHE_PATH = CACHE_DIR / "subprocess_cache.json"
+_subprocess_cache: dict | None = None  # loaded once per render
+_cache_lock = threading.Lock()
+_MISSING = object()  # sentinel to distinguish "cached None" from "no cache entry"
+
+
+def _load_subprocess_cache() -> dict:
+    """Load the subprocess cache file once per render."""
+    global _subprocess_cache
+    if _subprocess_cache is not None:
+        return _subprocess_cache
+    try:
+        with open(SUBPROCESS_CACHE_PATH) as f:
+            _subprocess_cache = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        _subprocess_cache = {}
+    return _subprocess_cache
+
+
+def _cached_result(key: str, ttl: int):
+    """Read a cached subprocess result if still fresh. Returns _MISSING on cache miss."""
+    cache = _load_subprocess_cache()
+    entry = cache.get(key)
+    if entry and time.time() - entry.get("timestamp", 0) < ttl:
+        return entry.get("data")
+    return _MISSING
+
+
+def _write_cached_result(key: str, data) -> None:
+    """Write a subprocess result to the shared cache (thread-safe, atomic)."""
+    try:
+        with _cache_lock:
+            cache = _load_subprocess_cache()
+            cache[key] = {"timestamp": time.time(), "data": data}
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(cache, f)
+                os.replace(tmp, SUBPROCESS_CACHE_PATH)
+            except BaseException:
+                os.unlink(tmp)
+                raise
+    except OSError:
+        pass
 
 
 def read_cache(ttl: int) -> dict | None:
@@ -222,10 +272,9 @@ def color_for_pct(pct: float, theme: dict) -> str:
     return GREEN
 
 
-def get_spotify_now_playing() -> dict | None:
-    """Get current Spotify track info. Returns None if Spotify not running."""
+def _fetch_spotify_now_playing() -> dict | None:
+    """Get current Spotify track info (uncached). Returns None if Spotify not running."""
     try:
-        # Check if Spotify is running
         result = subprocess.run(
             ["osascript", "-e",
              'tell application "System Events" to (name of processes) contains "Spotify"'],
@@ -234,13 +283,11 @@ def get_spotify_now_playing() -> dict | None:
         if result.returncode != 0 or "true" not in result.stdout.lower():
             return None
 
-        # Get track info
         track_result = subprocess.run(
             ["osascript", "-e",
              'tell application "Spotify" to return (name of current track) & " - " & (artist of current track)'],
             capture_output=True, text=True, timeout=2,
         )
-        # Get player state
         state_result = subprocess.run(
             ["osascript", "-e",
              'tell application "Spotify" to player state as string'],
@@ -256,12 +303,21 @@ def get_spotify_now_playing() -> dict | None:
         return None
 
 
-def get_focus_status() -> dict | None:
-    """Detect macOS Focus/DND status. Returns dict with 'active' bool."""
+def get_spotify_now_playing() -> dict | None:
+    """Get current Spotify track info with 5s cache."""
+    cached = _cached_result("spotify", 5)
+    if cached is not _MISSING:
+        return cached
+    result = _fetch_spotify_now_playing()
+    _write_cached_result("spotify", result)
+    return result
+
+
+def _fetch_focus_status() -> dict | None:
+    """Detect macOS Focus/DND status (uncached)."""
     if platform.system() != "Darwin":
         return None
     try:
-        # Check assertion store for active focus modes
         assertions_path = Path.home() / "Library" / "DoNotDisturb" / "DB" / "Assertions.json"
         result = subprocess.run(
             ["plutil", "-p", str(assertions_path)],
@@ -269,9 +325,7 @@ def get_focus_status() -> dict | None:
         )
         if result.returncode == 0:
             output = result.stdout
-            # If there are active assertions with storeAssertionRecords entries, focus is on
             if "storeAssertionRecords" in output:
-                # Check if there are actual entries (non-empty dict)
                 import re
                 records_match = re.search(r"storeAssertionRecords.*?=>.*?\{(.*?)\}", output, re.DOTALL)
                 if records_match and records_match.group(1).strip():
@@ -281,7 +335,6 @@ def get_focus_status() -> dict | None:
         pass
 
     try:
-        # Fallback: check controlcenter defaults
         result = subprocess.run(
             ["defaults", "read", "com.apple.controlcenter", "NSStatusItem Visible FocusModes"],
             capture_output=True, text=True, timeout=2,
@@ -294,21 +347,29 @@ def get_focus_status() -> dict | None:
     return None
 
 
-def get_system_info() -> dict | None:
-    """Get CPU and memory usage."""
+def get_focus_status() -> dict | None:
+    """Detect macOS Focus/DND status with 10s cache."""
+    cached = _cached_result("focus", 10)
+    if cached is not _MISSING:
+        return cached
+    result = _fetch_focus_status()
+    _write_cached_result("focus", result)
+    return result
+
+
+def _fetch_system_info() -> dict | None:
+    """Get CPU and memory usage (uncached)."""
     try:
         cpu_pct = None
         mem_pct = None
 
-        # CPU: sum all process CPU usage, normalize by core count
         cpu_result = subprocess.run(
             ["ps", "-A", "-o", "%cpu"],
             capture_output=True, text=True, timeout=3,
         )
         if cpu_result.returncode == 0:
-            lines = cpu_result.stdout.strip().split("\n")[1:]  # skip header
+            lines = cpu_result.stdout.strip().split("\n")[1:]
             total_cpu = sum(float(l.strip()) for l in lines if l.strip())
-            # Get core count
             ncpu_result = subprocess.run(
                 ["sysctl", "-n", "hw.ncpu"],
                 capture_output=True, text=True, timeout=2,
@@ -316,7 +377,6 @@ def get_system_info() -> dict | None:
             ncpu = int(ncpu_result.stdout.strip()) if ncpu_result.returncode == 0 else 1
             cpu_pct = min(100.0, total_cpu / ncpu)
 
-        # Memory: parse vm_stat
         mem_result = subprocess.run(
             ["vm_stat"],
             capture_output=True, text=True, timeout=3,
@@ -328,7 +388,7 @@ def get_system_info() -> dict | None:
                 m = re.match(r"(.+?):\s+(\d+)", line)
                 if m:
                     pages[m.group(1).strip().lower()] = int(m.group(2))
-            page_size = 16384  # default
+            page_size = 16384
             ps_match = re.search(r"page size of (\d+) bytes", mem_result.stdout)
             if ps_match:
                 page_size = int(ps_match.group(1))
@@ -338,7 +398,6 @@ def get_system_info() -> dict | None:
             inactive = pages.get("pages inactive", 0)
             speculative = pages.get("pages speculative", 0)
             wired = pages.get("pages wired down", 0)
-            # Total = all known page categories
             total = free + active + inactive + speculative + wired
             if total > 0:
                 used = active + wired
@@ -349,6 +408,16 @@ def get_system_info() -> dict | None:
     except (subprocess.TimeoutExpired, OSError, ValueError):
         pass
     return None
+
+
+def get_system_info() -> dict | None:
+    """Get CPU and memory usage with 5s cache."""
+    cached = _cached_result("system", 5)
+    if cached is not _MISSING:
+        return cached
+    result = _fetch_system_info()
+    _write_cached_result("system", result)
+    return result
 
 
 def _read_stretch_state() -> dict:
@@ -428,6 +497,225 @@ def format_reset_time(iso_str: str) -> str:
         return iso_str
 
 
+# ─── GitHub Contributions ────────────────────────────────────────────────────
+
+CONTRIBUTIONS_CACHE_PATH = CACHE_DIR / "contributions.json"
+CONTRIBUTIONS_CACHE_TTL = 86400  # 24 hours
+
+# GitHub's exact green palette (RGB)
+CONTRIB_COLORS = {
+    "NONE": (45, 45, 45),
+    "FIRST_QUARTILE": (155, 233, 168),
+    "SECOND_QUARTILE": (64, 196, 99),
+    "THIRD_QUARTILE": (48, 161, 78),
+    "FOURTH_QUARTILE": (33, 110, 57),
+}
+
+
+def _fg_color(r: int, g: int, b: int) -> str:
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+def _bg_color(r: int, g: int, b: int) -> str:
+    return f"\033[48;2;{r};{g};{b}m"
+
+
+def _read_contributions_cache() -> dict | None:
+    try:
+        with open(CONTRIBUTIONS_CACHE_PATH) as f:
+            cached = json.load(f)
+        if time.time() - cached.get("timestamp", 0) < CONTRIBUTIONS_CACHE_TTL:
+            return cached
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _write_contributions_cache(data: dict) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        data["timestamp"] = time.time()
+        with open(CONTRIBUTIONS_CACHE_PATH, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+def _fetch_contributions() -> dict | None:
+    """Fetch last 8 weeks of GitHub contributions via gh CLI."""
+    cached = _read_contributions_cache()
+    if cached:
+        return cached
+
+    try:
+        # Get username
+        user_result = subprocess.run(
+            ["gh", "api", "user", "--jq", ".login"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if user_result.returncode != 0:
+            return None
+        username = user_result.stdout.strip()
+        if not username:
+            return None
+
+        # Compute date range: last 8 weeks
+        now = datetime.now(timezone.utc)
+        from_date = (now - timedelta(weeks=8)).strftime("%Y-%m-%dT00:00:00Z")
+        to_date = now.strftime("%Y-%m-%dT23:59:59Z")
+
+        query = """
+query($user: String!, $from: DateTime!, $to: DateTime!) {
+  user(login: $user) {
+    contributionsCollection(from: $from, to: $to) {
+      contributionCalendar {
+        totalContributions
+        weeks {
+          contributionDays {
+            contributionLevel
+            weekday
+          }
+        }
+      }
+    }
+  }
+}"""
+        gh_result = subprocess.run(
+            ["gh", "api", "graphql",
+             "-f", f"query={query}",
+             "-F", f"user={username}",
+             "-F", f"from={from_date}",
+             "-F", f"to={to_date}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if gh_result.returncode != 0:
+            return None
+
+        resp = json.loads(gh_result.stdout)
+        cal = resp["data"]["user"]["contributionsCollection"]["contributionCalendar"]
+        weeks = cal["weeks"]
+        total = cal["totalContributions"]
+
+        # Take last 8 weeks
+        weeks = weeks[-8:] if len(weeks) > 8 else weeks
+
+        result = {"username": username, "total": total, "weeks": []}
+        for w in weeks:
+            days = []
+            for d in w["contributionDays"]:
+                days.append(d["contributionLevel"])
+            result["weeks"].append(days)
+
+        _write_contributions_cache(result)
+        return result
+
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def _fetch_git_status() -> str | None:
+    """Get a compact git status summary (uncached)."""
+    try:
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if branch_result.returncode != 0:
+            return None
+        branch = branch_result.stdout.strip()
+
+        diff_result = subprocess.run(
+            ["git", "diff", "--numstat", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        added = 0
+        removed = 0
+        if diff_result.returncode == 0:
+            for line in diff_result.stdout.strip().split("\n"):
+                if not line:
+                    continue
+                parts_raw = line.split("\t")
+                if len(parts_raw) >= 2 and parts_raw[0] != "-":
+                    added += int(parts_raw[0])
+                    removed += int(parts_raw[1])
+
+        parts = [f"{CYAN}{branch}{RESET}"]
+        if added or removed:
+            parts.append(f"{GREEN}+{added}{RESET}")
+            parts.append(f"{RED}-{removed}{RESET}")
+        else:
+            parts.append(f"{DIM}clean{RESET}")
+
+        return " ".join(parts)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+
+
+def _get_git_status() -> str | None:
+    """Get a compact git status summary with 5s cache."""
+    cached = _cached_result("git_status", 5)
+    if cached is not _MISSING:
+        return cached
+    result = _fetch_git_status()
+    _write_cached_result("git_status", result)
+    return result
+
+
+def _render_contribution_grid(data: dict) -> list[str]:
+    """Render contribution data as a 4-line half-block grid with day labels.
+
+    Uses ▀ to pack two days per character. Rows = Mon–Sun, Columns = weeks.
+    """
+    weeks = data["weeks"]
+    total = data["total"]
+    num_weeks = len(weeks)
+
+    # Build grid: grid[row][col], row 0=Sun..6=Sat (GitHub API order)
+    grid = [["NONE"] * num_weeks for _ in range(7)]
+    for col, week_days in enumerate(weeks):
+        for i, level in enumerate(week_days):
+            if i < 7:
+                grid[i][col] = level
+
+    def _half_block(top_level: str, bot_level: str) -> str:
+        top_rgb = CONTRIB_COLORS.get(top_level, CONTRIB_COLORS["NONE"])
+        bot_rgb = CONTRIB_COLORS.get(bot_level, CONTRIB_COLORS["NONE"])
+        return f"{_fg_color(*top_rgb)}{_bg_color(*bot_rgb)}▀{RESET}"
+
+    def _solo_block(level: str) -> str:
+        rgb = CONTRIB_COLORS.get(level, CONTRIB_COLORS["NONE"])
+        return f"{_fg_color(*rgb)}{_bg_color(*rgb)}▀{RESET}"
+
+    # Pairs in Mon–Sun order: (Mon+Tue), (Wed+Thu), (Fri+Sat), Sun solo
+    # GitHub API: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+    row_pairs = [(1, 2), (3, 4), (5, 6)]
+    day_labels = ["M", "W", "F", "S"]
+
+    # Right-side info
+    git_status = _get_git_status()
+    count_str = f"{total} contributions"
+    weeks_str = f"{DIM}{num_weeks}w{RESET}"
+
+    result_lines = []
+    for idx, (top_row, bot_row) in enumerate(row_pairs):
+        blocks = "".join(_half_block(grid[top_row][col], grid[bot_row][col]) for col in range(num_weeks))
+        line = f"{DIM}{day_labels[idx]}{RESET} {blocks}"
+        if idx == 0 and git_status:
+            result_lines.append(f"{line}  {git_status}")
+        elif idx == 1:
+            result_lines.append(f"{line}  {count_str}")
+        elif idx == 2:
+            result_lines.append(f"{line}  {weeks_str}")
+        else:
+            result_lines.append(line)
+
+    # Sun solo row
+    sun_blocks = "".join(_solo_block(grid[0][col]) for col in range(num_weeks))
+    result_lines.append(f"{DIM}{day_labels[3]}{RESET} {sun_blocks}")
+
+    return result_lines
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
@@ -437,30 +725,9 @@ def strip_ansi(s: str) -> str:
     return re.sub(r"\033\[[0-9;]*m", "", s)
 
 
-BRAILLE_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-SPINNER_STATE_PATH = CACHE_DIR / "spinner.state"
-
-
-def _spinner_char() -> str:
-    """Return the next braille spinner frame, persisted across renders."""
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        idx = 0
-        try:
-            idx = int(SPINNER_STATE_PATH.read_text().strip())
-        except (OSError, ValueError):
-            pass
-        char = BRAILLE_FRAMES[idx % len(BRAILLE_FRAMES)]
-        SPINNER_STATE_PATH.write_text(str((idx + 1) % len(BRAILLE_FRAMES)))
-        return f"{CYAN}{char}{RESET}"
-    except OSError:
-        return BRAILLE_FRAMES[0]
-
-
-def box_frame(lines: list, title: str = "", min_width: int = 0, footer_right: str = "", title_right: str = "") -> str:
+def box_frame(lines: list, title: str = "", min_width: int = 0, title_right: str = "") -> str:
     """Wrap lines in a Unicode box-drawing frame with an optional title.
 
-    footer_right places a string right-aligned on its own line before the bottom border.
     title_right places a string right-aligned in the top border.
     """
     content_widths = [len(strip_ansi(l)) for l in lines]
@@ -483,10 +750,6 @@ def box_frame(lines: list, title: str = "", min_width: int = 0, footer_right: st
     for line in lines:
         pad = width - len(strip_ansi(line))
         framed.append(f"│ {line}{' ' * pad} │")
-    if footer_right:
-        vis_len = len(strip_ansi(footer_right))
-        pad = width - vis_len
-        framed.append(f"│ {' ' * pad}{footer_right} │")
     framed.append(bottom)
     return "\n".join(framed)
 
@@ -567,11 +830,33 @@ def main() -> None:
     if reset_parts:
         content_lines.append(f"{DIM}{'  · '.join(reset_parts)}{RESET}")
 
-    # ── Spotify + Focus + System (single line) ────────────────────────
+    # ── Parallel fetch: Spotify, Focus, System, Contributions ──────
+    PARALLEL_TIMEOUT = 5  # seconds — never block render longer than this
+    futures: dict[str, object] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        if show.get("spotify", True):
+            futures["spotify"] = pool.submit(get_spotify_now_playing)
+        if show.get("focus", True):
+            futures["focus"] = pool.submit(get_focus_status)
+        if show.get("system", True):
+            futures["system"] = pool.submit(get_system_info)
+        if show.get("contributions", True):
+            futures["contributions"] = pool.submit(_fetch_contributions)
+        parallel: dict[str, object] = {}
+        for k, f in futures.items():
+            try:
+                parallel[k] = f.result(timeout=PARALLEL_TIMEOUT)
+            except TimeoutError:
+                # For contributions, fall back to stale cache (ignore TTL)
+                if k == "contributions":
+                    parallel[k] = _read_contributions_cache()
+                else:
+                    parallel[k] = None
+
     info_parts: list[str] = []
 
     if show.get("spotify", True):
-        spotify = get_spotify_now_playing()
+        spotify = parallel.get("spotify")
         if spotify:
             icon = "▶" if spotify["state"] == "playing" else "⏸"
             track = spotify["track"]
@@ -583,14 +868,14 @@ def main() -> None:
             info_parts.append(f"{DIM}♫ Not playing{RESET}")
 
     if show.get("focus", True):
-        focus = get_focus_status()
+        focus = parallel.get("focus")
         if focus and focus.get("active"):
             info_parts.append(f"{YELLOW}Focus On{RESET}")
         else:
             info_parts.append(f"{DIM}Focus Off{RESET}")
 
     if show.get("system", True):
-        sysinfo = get_system_info()
+        sysinfo = parallel.get("system")
         if sysinfo:
             if sysinfo.get("cpu") is not None:
                 cpu = sysinfo["cpu"]
@@ -611,6 +896,14 @@ def main() -> None:
     if info_parts:
         content_lines.append(f"{'  ·  '.join(info_parts)}")
 
+    # ── GitHub Contributions heatmap ──────────────────────────────────
+    if show.get("contributions", True):
+        contrib_data = parallel.get("contributions")
+        if contrib_data and contrib_data.get("weeks"):
+            content_lines.append("")  # padding
+            contrib_lines = _render_contribution_grid(contrib_data)
+            content_lines.extend(contrib_lines)
+
     # ── Stretch reminder ────────────────────────────────────────────
     title_right = ""
     if show.get("stretch", True):
@@ -621,9 +914,8 @@ def main() -> None:
             title_right = f"⏱ {elapsed}"
 
     # ── Output in box frame ───────────────────────────────────────────
-    spinner = _spinner_char()
     if content_lines:
-        print(box_frame(content_lines, title=model_name, footer_right=spinner, title_right=title_right))
+        print(box_frame(content_lines, title=model_name, title_right=title_right))
     else:
         print(model_name)
 
