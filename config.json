@@ -8,7 +8,8 @@
     "spotify": true,
     "focus": true,
     "system": true,
-    "stretch": true
+    "stretch": true,
+    "contributions": true
   },
   "bar_size": 10,
   "cache_ttl_seconds": 60,

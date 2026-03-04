@@ -1,16 +1,25 @@
 # Redline
 
-A Claude Code plugin that displays a rich statusline showing model info, context window usage, and session/weekly rate limits with progress bars.
+A Claude Code statusline plugin that displays model info, usage limits, Spotify, system metrics, GitHub contributions, and more — all in a compact box frame.
 
 ```
-Opus 4.6 | 0 / 1.0m | 0% used 0 | 100% remain 1000000
-current: ○○○○○○○○○○ 1%   |  weekly: ●○○○○○○○○○ 16%
-resets 2:30pm              |  resets mar 6, 8:30am
+╭─ Claude Opus 4 ────────────────────────────────────────────────────── ⏱ 34m ─╮
+│ ctx ████░░░░░░ 42%  sess █░░░░░░░░░ 13%  week ███░░░░░░░ 26%                 │
+│ ↻ sess 6:00pm  · week mar 5, 7:00pm                                          │
+│ ♫ ▶ Overcompensate - Twenty One Pilots  ·  Focus Off  ·  CPU 32%  ·  MEM 71% │
+│                                                                              │
+│ M ▀▀▀▀▀▀▀▀  chcardoz/montreal +323 -51                                       │
+│ W ▀▀▀▀▀▀▀▀  262 contributions                                                │
+│ F ▀▀▀▀▀▀▀▀  8w                                                               │
+│ S ▀▀▀▀▀▀▀▀                                                                   │
+╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
 ## Requirements
 
 - Python 3.10+
+- macOS (for Spotify, Focus, and system metrics via `osascript`, `vm_stat`, etc.)
+- `gh` CLI (for GitHub contributions graph)
 
 ## Installation
 
@@ -48,18 +57,22 @@ When installing, you pick a scope:
 
 ## What it shows
 
-| Line | Content |
-|------|---------|
-| 1 | Model name, token count / window size, used %, remaining % |
-| 2 | Session (5-hour) and weekly (7-day) usage progress bars |
-| 3 | Reset times for session and weekly limits |
+| Section | Content |
+|---------|---------|
+| Progress bars | Context window, session (5h), and weekly (7d) usage with color-coded bars |
+| Reset times | When session and weekly limits reset |
+| Spotify | Currently playing track and play/pause state |
+| Focus | macOS Focus/DND status |
+| System | CPU and memory usage percentages |
+| Contributions | 8-week GitHub contribution heatmap with git branch and diff stats |
+| Stretch reminder | Session elapsed time with periodic stretch notifications |
 
 Progress bars are color-coded:
 - **Green** — usage below 50%
 - **Yellow** — usage between 50–80%
 - **Red** — usage above 80%
 
-Lines 2–3 require an OAuth token. Without one, the statusline gracefully falls back to showing only model and context info.
+Usage bars require an OAuth token. Without one, the statusline gracefully falls back to skeleton bars.
 
 ## Configuration
 
@@ -72,10 +85,17 @@ Edit `config.json` in the plugin directory:
     "context": true,
     "session": true,
     "weekly": true,
-    "reset_times": true
+    "reset_times": true,
+    "spotify": true,
+    "focus": true,
+    "system": true,
+    "stretch": true,
+    "contributions": true
   },
   "bar_size": 10,
   "cache_ttl_seconds": 60,
+  "stretch_interval_minutes": 15,
+  "stretch_sound": "Glass",
   "theme": {
     "low_threshold": 50,
     "high_threshold": 80
@@ -87,9 +107,17 @@ Edit `config.json` in the plugin directory:
 |--------|-------------|---------|
 | `show.*` | Toggle individual sections on/off | all `true` |
 | `bar_size` | Number of characters in progress bars | `10` |
-| `cache_ttl_seconds` | How long to cache API responses | `60` |
+| `cache_ttl_seconds` | How long to cache API usage responses | `60` |
+| `stretch_interval_minutes` | Minutes between stretch reminder notifications | `15` |
+| `stretch_sound` | macOS sound name for stretch notifications | `"Glass"` |
 | `theme.low_threshold` | Usage % below this is green | `50` |
 | `theme.high_threshold` | Usage % above this is red | `80` |
+
+## Performance
+
+Expensive subprocess calls (Spotify, Focus, system metrics, git status) are cached with short TTLs (5–10s) and run in parallel using a thread pool. This brings typical render time down from ~500ms to under 100ms on cache hits.
+
+Cache files are stored in `~/.cache/redline/`. Delete the directory to force a fresh fetch.
 
 ## Credential sources
 
@@ -98,10 +126,6 @@ The plugin looks for an OAuth token in this order:
 1. `~/.claude/.credentials.json` → `claudeAiOauth.accessToken`
 2. macOS Keychain → "Claude Code-credentials" (macOS only)
 3. `CLAUDE_CODE_OAUTH_TOKEN` environment variable
-
-## Cache
-
-Usage data is cached at `~/.cache/redline/cache.json` to avoid excessive API calls. Delete this file to force a fresh fetch.
 
 ## Managing the plugin
 
