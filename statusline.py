@@ -3,9 +3,11 @@
 # ///
 """Redline — Rich statusline for Claude Code."""
 
+import hashlib
 import json
 import os
 import platform
+import re
 import ssl
 import subprocess
 import sys
@@ -242,8 +244,9 @@ def _write_output_cache(stdin_data: dict, output: str) -> None:
 
 
 def _hash_stdin(stdin_data: dict) -> str:
-    """Quick deterministic hash of stdin data for cache invalidation."""
-    return json.dumps(stdin_data, sort_keys=True, separators=(",", ":"))
+    """Deterministic hash of stdin data for cache invalidation."""
+    raw = json.dumps(stdin_data, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 # ─── API ─────────────────────────────────────────────────────────────────────
@@ -328,7 +331,7 @@ def _fetch_spotify_now_playing() -> dict | None:
             '    tell application "Spotify"\n'
             '      set t to (name of current track) & " - " & (artist of current track)\n'
             '      set s to player state as string\n'
-            '      return t & "\\n" & s\n'
+            '      return t & linefeed & s\n'
             '    end tell\n'
             '  else\n'
             '    return "NOT_RUNNING"\n'
@@ -375,7 +378,6 @@ def _fetch_focus_status() -> dict | None:
         if result.returncode == 0:
             output = result.stdout
             if "storeAssertionRecords" in output:
-                import re
                 records_match = re.search(r"storeAssertionRecords.*?=>.*?\{(.*?)\}", output, re.DOTALL)
                 if records_match and records_match.group(1).strip():
                     return {"active": True}
@@ -406,6 +408,16 @@ def get_focus_status() -> dict | None:
     return result
 
 
+def _mem_to_mb(val: str, unit: str) -> float:
+    """Convert a memory value with M/G/T suffix to megabytes."""
+    v = float(val)
+    if unit == "T":
+        return v * 1024 * 1024
+    if unit == "G":
+        return v * 1024
+    return v
+
+
 def _fetch_system_info() -> dict | None:
     """Get CPU and memory usage (uncached).
 
@@ -416,8 +428,6 @@ def _fetch_system_info() -> dict | None:
     try:
         cpu_pct = None
         mem_pct = None
-
-        import re
 
         # Single 'top' invocation gives both CPU and memory in a compact summary
         top_result = subprocess.run(
@@ -433,14 +443,11 @@ def _fetch_system_info() -> dict | None:
                         cpu_pct = min(100.0, 100.0 - float(idle_m.group(1)))
                 # PhysMem: "PhysMem: 16G used (2345M wired, ...M compressor), 567M unused."
                 if line.startswith("PhysMem:"):
-                    used_m = re.search(r"([\d.]+)([MG])\s*used", line)
-                    unused_m = re.search(r"([\d.]+)([MG])\s*unused", line)
+                    used_m = re.search(r"([\d.]+)([MGT])\s*used", line)
+                    unused_m = re.search(r"([\d.]+)([MGT])\s*unused", line)
                     if used_m and unused_m:
-                        def _to_mb(val: str, unit: str) -> float:
-                            v = float(val)
-                            return v * 1024 if unit == "G" else v
-                        used_mb = _to_mb(used_m.group(1), used_m.group(2))
-                        unused_mb = _to_mb(unused_m.group(1), unused_m.group(2))
+                        used_mb = _mem_to_mb(used_m.group(1), used_m.group(2))
+                        unused_mb = _mem_to_mb(unused_m.group(1), unused_m.group(2))
                         total_mb = used_mb + unused_mb
                         if total_mb > 0:
                             mem_pct = (used_mb / total_mb) * 100
@@ -764,7 +771,6 @@ def _render_contribution_grid(data: dict) -> list[str]:
 
 def strip_ansi(s: str) -> str:
     """Remove ANSI escape sequences for visible-length calculation."""
-    import re
     return re.sub(r"\033\[[0-9;]*m", "", s)
 
 
@@ -804,6 +810,13 @@ def main() -> None:
     theme = config["theme"]
 
     stdin_data = read_stdin()
+
+    # Always tick the stretch reminder so last_render stays fresh and
+    # notifications fire on time, even when the output cache hits.
+    if show.get("stretch", True):
+        interval = config.get("stretch_interval_minutes", 15)
+        sound = config.get("stretch_sound", "Glass")
+        _check_stretch_reminder(interval, sound)
 
     # ── Fast path: reuse cached output if stdin unchanged and cache fresh ──
     cached_output = _read_output_cache(stdin_data)
