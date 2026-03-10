@@ -25,6 +25,8 @@ CONFIG_PATH = PLUGIN_ROOT / "config.json"
 CACHE_DIR = Path.home() / ".cache" / "redline"
 CACHE_PATH = CACHE_DIR / "cache.json"
 STRETCH_STATE_PATH = CACHE_DIR / "stretch_state.json"
+OUTPUT_CACHE_PATH = CACHE_DIR / "output_cache.json"
+OUTPUT_CACHE_TTL = 3  # seconds — reuse rendered output if fresh
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
 HTTP_TIMEOUT = 5
@@ -202,6 +204,48 @@ def write_cache(usage_data: dict) -> None:
         pass
 
 
+# ─── Output cache ────────────────────────────────────────────────────────────
+
+
+def _read_output_cache(stdin_data: dict) -> str | None:
+    """Return cached rendered output if still fresh and stdin hasn't changed."""
+    try:
+        with open(OUTPUT_CACHE_PATH) as f:
+            cached = json.load(f)
+        if time.time() - cached.get("timestamp", 0) >= OUTPUT_CACHE_TTL:
+            return None
+        if cached.get("stdin_hash") != _hash_stdin(stdin_data):
+            return None
+        return cached.get("output")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_output_cache(stdin_data: dict, output: str) -> None:
+    """Cache the rendered output string."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump({
+                    "timestamp": time.time(),
+                    "stdin_hash": _hash_stdin(stdin_data),
+                    "output": output,
+                }, f)
+            os.replace(tmp, OUTPUT_CACHE_PATH)
+        except BaseException:
+            os.unlink(tmp)
+            raise
+    except OSError:
+        pass
+
+
+def _hash_stdin(stdin_data: dict) -> str:
+    """Quick deterministic hash of stdin data for cache invalidation."""
+    return json.dumps(stdin_data, sort_keys=True, separators=(",", ":"))
+
+
 # ─── API ─────────────────────────────────────────────────────────────────────
 
 
@@ -273,32 +317,37 @@ def color_for_pct(pct: float, theme: dict) -> str:
 
 
 def _fetch_spotify_now_playing() -> dict | None:
-    """Get current Spotify track info (uncached). Returns None if Spotify not running."""
+    """Get current Spotify track info (uncached). Returns None if Spotify not running.
+
+    Uses a single osascript call to check running state, track, and player state.
+    """
     try:
+        script = (
+            'tell application "System Events"\n'
+            '  if (name of processes) contains "Spotify" then\n'
+            '    tell application "Spotify"\n'
+            '      set t to (name of current track) & " - " & (artist of current track)\n'
+            '      set s to player state as string\n'
+            '      return t & "\\n" & s\n'
+            '    end tell\n'
+            '  else\n'
+            '    return "NOT_RUNNING"\n'
+            '  end if\n'
+            'end tell'
+        )
         result = subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to (name of processes) contains "Spotify"'],
-            capture_output=True, text=True, timeout=2,
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=3,
         )
-        if result.returncode != 0 or "true" not in result.stdout.lower():
+        if result.returncode != 0:
             return None
-
-        track_result = subprocess.run(
-            ["osascript", "-e",
-             'tell application "Spotify" to return (name of current track) & " - " & (artist of current track)'],
-            capture_output=True, text=True, timeout=2,
-        )
-        state_result = subprocess.run(
-            ["osascript", "-e",
-             'tell application "Spotify" to player state as string'],
-            capture_output=True, text=True, timeout=2,
-        )
-        if track_result.returncode != 0:
+        output = result.stdout.strip()
+        if output == "NOT_RUNNING":
             return None
-
-        track_info = track_result.stdout.strip()
-        state = state_result.stdout.strip().lower() if state_result.returncode == 0 else "unknown"
-        return {"track": track_info, "state": state}
+        parts = output.split("\n", 1)
+        if len(parts) < 2:
+            return None
+        return {"track": parts[0].strip(), "state": parts[1].strip().lower()}
     except (subprocess.TimeoutExpired, OSError):
         return None
 
@@ -358,50 +407,43 @@ def get_focus_status() -> dict | None:
 
 
 def _fetch_system_info() -> dict | None:
-    """Get CPU and memory usage (uncached)."""
+    """Get CPU and memory usage (uncached).
+
+    Uses 'top -l 1 -n 0 -s 0' for a single-sample summary instead of
+    'ps -A -o %cpu' which lists every process (heavy stdout, contributes
+    to ArrayBuffer accumulation in the Node.js host process).
+    """
     try:
         cpu_pct = None
         mem_pct = None
 
-        cpu_result = subprocess.run(
-            ["ps", "-A", "-o", "%cpu"],
+        import re
+
+        # Single 'top' invocation gives both CPU and memory in a compact summary
+        top_result = subprocess.run(
+            ["top", "-l", "1", "-n", "0", "-s", "0"],
             capture_output=True, text=True, timeout=3,
         )
-        if cpu_result.returncode == 0:
-            lines = cpu_result.stdout.strip().split("\n")[1:]
-            total_cpu = sum(float(l.strip()) for l in lines if l.strip())
-            ncpu_result = subprocess.run(
-                ["sysctl", "-n", "hw.ncpu"],
-                capture_output=True, text=True, timeout=2,
-            )
-            ncpu = int(ncpu_result.stdout.strip()) if ncpu_result.returncode == 0 else 1
-            cpu_pct = min(100.0, total_cpu / ncpu)
-
-        mem_result = subprocess.run(
-            ["vm_stat"],
-            capture_output=True, text=True, timeout=3,
-        )
-        if mem_result.returncode == 0:
-            import re
-            pages = {}
-            for line in mem_result.stdout.split("\n"):
-                m = re.match(r"(.+?):\s+(\d+)", line)
-                if m:
-                    pages[m.group(1).strip().lower()] = int(m.group(2))
-            page_size = 16384
-            ps_match = re.search(r"page size of (\d+) bytes", mem_result.stdout)
-            if ps_match:
-                page_size = int(ps_match.group(1))
-
-            free = pages.get("pages free", 0)
-            active = pages.get("pages active", 0)
-            inactive = pages.get("pages inactive", 0)
-            speculative = pages.get("pages speculative", 0)
-            wired = pages.get("pages wired down", 0)
-            total = free + active + inactive + speculative + wired
-            if total > 0:
-                used = active + wired
-                mem_pct = (used / total) * 100
+        if top_result.returncode == 0:
+            for line in top_result.stdout.split("\n"):
+                # CPU usage: "CPU usage: 5.26% user, 3.94% sys, 90.79% idle"
+                if line.startswith("CPU usage:"):
+                    idle_m = re.search(r"([\d.]+)%\s*idle", line)
+                    if idle_m:
+                        cpu_pct = min(100.0, 100.0 - float(idle_m.group(1)))
+                # PhysMem: "PhysMem: 16G used (2345M wired, ...M compressor), 567M unused."
+                if line.startswith("PhysMem:"):
+                    used_m = re.search(r"([\d.]+)([MG])\s*used", line)
+                    unused_m = re.search(r"([\d.]+)([MG])\s*unused", line)
+                    if used_m and unused_m:
+                        def _to_mb(val: str, unit: str) -> float:
+                            v = float(val)
+                            return v * 1024 if unit == "G" else v
+                        used_mb = _to_mb(used_m.group(1), used_m.group(2))
+                        unused_mb = _to_mb(unused_m.group(1), unused_m.group(2))
+                        total_mb = used_mb + unused_mb
+                        if total_mb > 0:
+                            mem_pct = (used_mb / total_mb) * 100
 
         if cpu_pct is not None or mem_pct is not None:
             return {"cpu": cpu_pct, "mem": mem_pct}
@@ -502,22 +544,23 @@ def format_reset_time(iso_str: str) -> str:
 CONTRIBUTIONS_CACHE_PATH = CACHE_DIR / "contributions.json"
 CONTRIBUTIONS_CACHE_TTL = 86400  # 24 hours
 
-# GitHub's exact green palette (RGB)
-CONTRIB_COLORS = {
-    "NONE": (45, 45, 45),
-    "FIRST_QUARTILE": (155, 233, 168),
-    "SECOND_QUARTILE": (64, 196, 99),
-    "THIRD_QUARTILE": (48, 161, 78),
-    "FOURTH_QUARTILE": (33, 110, 57),
+# GitHub green palette — 256-color approximations (much smaller output than
+# true-color \033[38;2;R;G;Bm sequences, reducing per-render buffer size by ~60%).
+CONTRIB_COLORS_256 = {
+    "NONE": 239,              # dark gray
+    "FIRST_QUARTILE": 157,    # light green
+    "SECOND_QUARTILE": 71,    # medium green
+    "THIRD_QUARTILE": 35,     # darker green
+    "FOURTH_QUARTILE": 22,    # darkest green
 }
 
 
-def _fg_color(r: int, g: int, b: int) -> str:
-    return f"\033[38;2;{r};{g};{b}m"
+def _fg_256(code: int) -> str:
+    return f"\033[38;5;{code}m"
 
 
-def _bg_color(r: int, g: int, b: int) -> str:
-    return f"\033[48;2;{r};{g};{b}m"
+def _bg_256(code: int) -> str:
+    return f"\033[48;5;{code}m"
 
 
 def _read_contributions_cache() -> dict | None:
@@ -678,13 +721,13 @@ def _render_contribution_grid(data: dict) -> list[str]:
                 grid[i][col] = level
 
     def _half_block(top_level: str, bot_level: str) -> str:
-        top_rgb = CONTRIB_COLORS.get(top_level, CONTRIB_COLORS["NONE"])
-        bot_rgb = CONTRIB_COLORS.get(bot_level, CONTRIB_COLORS["NONE"])
-        return f"{_fg_color(*top_rgb)}{_bg_color(*bot_rgb)}▀{RESET}"
+        top_c = CONTRIB_COLORS_256.get(top_level, CONTRIB_COLORS_256["NONE"])
+        bot_c = CONTRIB_COLORS_256.get(bot_level, CONTRIB_COLORS_256["NONE"])
+        return f"{_fg_256(top_c)}{_bg_256(bot_c)}▀{RESET}"
 
     def _solo_block(level: str) -> str:
-        rgb = CONTRIB_COLORS.get(level, CONTRIB_COLORS["NONE"])
-        return f"{_fg_color(*rgb)}{_bg_color(*rgb)}▀{RESET}"
+        c = CONTRIB_COLORS_256.get(level, CONTRIB_COLORS_256["NONE"])
+        return f"{_fg_256(c)}{_bg_256(c)}▀{RESET}"
 
     # Pairs in Mon–Sun order: (Mon+Tue), (Wed+Thu), (Fri+Sat), Sun solo
     # GitHub API: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
@@ -761,6 +804,13 @@ def main() -> None:
     theme = config["theme"]
 
     stdin_data = read_stdin()
+
+    # ── Fast path: reuse cached output if stdin unchanged and cache fresh ──
+    cached_output = _read_output_cache(stdin_data)
+    if cached_output is not None:
+        print(cached_output)
+        return
+
     model_info = stdin_data.get("model", {})
     ctx = stdin_data.get("context_window", {})
 
@@ -915,9 +965,11 @@ def main() -> None:
 
     # ── Output in box frame ───────────────────────────────────────────
     if content_lines:
-        print(box_frame(content_lines, title=model_name, title_right=title_right))
+        output = box_frame(content_lines, title=model_name, title_right=title_right)
     else:
-        print(model_name)
+        output = model_name
+    _write_output_cache(stdin_data, output)
+    print(output)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 {
   "name": "redline",
   "description": "Rich statusline showing model, context, session/weekly usage with progress bars",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "author": { "name": "chcardoz" },
   "commands": "./commands"
 }
